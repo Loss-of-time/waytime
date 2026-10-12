@@ -60,6 +60,10 @@ BROWSERS = {
     "zen", "firefox", "librewolf", "floorp", "chromium", "google-chrome",
     "brave-browser", "vivaldi-stable", "microsoft-edge", "opera",
 }
+# Resource classes for the Plasma desktop itself (Show Desktop / no windows
+# focused). Time with the desktop focused is idle time, not app usage —
+# never credit it.
+IGNORED_APPS = {"plasmashell", "org.kde.plasmashell"}
 BROWSER_SUFFIXES = (
     "zen browser", "zen", "mozilla firefox", "firefox", "librewolf", "floorp",
     "chromium", "google chrome", "brave", "vivaldi", "microsoft edge", "opera",
@@ -202,6 +206,8 @@ class Tracker(dbus.service.Object):
         if delta <= 0 or delta > MAX_DELTA:
             return
         if self.locked or not self.current_app:
+            return
+        if self.current_app in IGNORED_APPS:
             return
         self.store.add(self.current_app, self.current_site, delta)
 
