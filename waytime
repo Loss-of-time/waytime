@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""waytime — show tracked screen time from the waytime daemon.
+"""waytime — show tracked screen time and manage per-app daily limits.
 
 Usage:
   waytime                today's total and per-app breakdown
@@ -7,7 +7,12 @@ Usage:
   waytime week           per-day totals for the last 7 days
   waytime history [N]    per-day totals for the last N days (default 14)
   waytime apps [N]       per-app totals aggregated over the last N days (default 7)
+  waytime classes [N]    raw resourceClass values (for setting limits)
   waytime sites [N]      per-website totals over the last N days (default 1, i.e. today)
+  waytime limits         show configured per-app limits and today's usage
+  waytime limit set APP MINUTES [--warn 15,5,1] [--action close|kill]
+  waytime limit clear APP
+  waytime events         today's limit warnings and enforcements
 """
 
 import datetime as dt
@@ -15,7 +20,11 @@ import os
 import sqlite3
 import sys
 
-DB_PATH = os.path.expanduser("~/.local/share/waytime/waytime.db")
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import waytime_core as core  # noqa: E402
+
+DB_PATH = core.DB_PATH
+CONFIG_PATH = core.CONFIG_PATH
 BAR_WIDTH = 30
 
 PRETTY_NAMES = {
@@ -44,13 +53,7 @@ PRETTY_NAMES = {
 def pretty(app):
     if app in PRETTY_NAMES:
         return PRETTY_NAMES[app]
-    name = app
-    for prefix in ("org.kde.", "org.gnome.", "com.", "io.", "net.", "dev."):
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-            break
-    name = name.split(".")[-1]
-    return name.replace("-", " ").title() if name.islower() else name
+    return core.pretty_app(app)
 
 
 def fmt_duration(seconds):
@@ -69,10 +72,17 @@ def bar(fraction, width=BAR_WIDTH):
     return "█" * filled + "░" * (width - filled)
 
 
-def connect():
+def connect_soft():
     if not os.path.exists(DB_PATH):
-        sys.exit("No data yet. Is the daemon running?  systemctl --user status waytime")
+        return None
     return sqlite3.connect(DB_PATH)
+
+
+def connect():
+    db = connect_soft()
+    if db is None:
+        sys.exit("No data yet. Is the daemon running?  systemctl --user status waytime")
+    return db
 
 
 def day_label(date_str):
@@ -146,6 +156,24 @@ def show_apps(n):
     print()
 
 
+def show_classes(n):
+    db = connect()
+    start = (dt.date.today() - dt.timedelta(days=n - 1)).isoformat()
+    rows = db.execute(
+        "SELECT app, SUM(seconds) AS s FROM usage WHERE date >= ? GROUP BY app ORDER BY s DESC",
+        (start,),
+    ).fetchall()
+    if not rows:
+        print("No screen time recorded in this period.")
+        return
+    limits = core.load_limits(CONFIG_PATH)
+    print(f"\n  Last {n} days — raw resourceClass values\n")
+    for app, seconds in rows:
+        mark = "  [limit]" if core.find_limit(limits, app) else ""
+        print(f"  {app:<34.34} {fmt_duration(seconds):>7}{mark}")
+    print()
+
+
 def show_sites(n):
     db = connect()
     start = (dt.date.today() - dt.timedelta(days=n - 1)).isoformat()
@@ -170,6 +198,121 @@ def show_sites(n):
     print()
 
 
+def show_limits():
+    limits = core.load_limits(CONFIG_PATH)
+    if not limits:
+        print("No per-app limits configured.")
+        print("Add one with:  waytime limit set <resourceClass> <minutes>")
+        print("Find the resourceClass with:  waytime classes 7")
+        return
+    db = connect_soft()
+    print(f"\n  Per-app limits — {core.today()}\n")
+    print(f"  {'APP':<26.26} {'USED':>8} {'LIMIT':>7} {'LEFT':>9}  {'ACTION':<6}")
+    for limit in sorted(limits, key=lambda l: l.app.casefold()):
+        used = 0.0
+        if db is not None:
+            row = db.execute(
+                "SELECT seconds FROM usage WHERE date = ? AND app = ? COLLATE NOCASE",
+                (core.today(), limit.app),
+            ).fetchone()
+            if row:
+                used = float(row[0])
+        left = core.remaining_seconds(limit, used)
+        left_text = "exhausted" if left <= 0 else fmt_duration(left)
+        print(
+            f"  {limit.app:<26.26} {fmt_duration(used):>8} "
+            f"{str(limit.minutes) + 'm':>7} {left_text:>9}  {limit.action:<6}"
+        )
+    print("\n  Changes are picked up by the daemon within ~5 s.\n")
+
+
+def show_events():
+    db = connect_soft()
+    if db is None:
+        print("No data yet.")
+        return
+    rows = db.execute(
+        "SELECT ts, app, kind, detail FROM events WHERE date = ? ORDER BY ts",
+        (core.today(),),
+    ).fetchall()
+    if not rows:
+        print("No limit events today.")
+        return
+    print(f"\n  Limit events — {core.today()}\n")
+    for ts, app, kind, detail in rows:
+        print(f"  {ts[11:19]}  {kind:<8} {app:<28.28} {detail}")
+    print()
+
+
+def parse_warn(value):
+    minutes = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            number = int(part)
+        except ValueError:
+            sys.exit(f"Invalid warning threshold: {part}")
+        if number <= 0:
+            sys.exit(f"Warning thresholds must be positive: {part}")
+        minutes.add(number)
+    if not minutes:
+        sys.exit("Empty --warn list")
+    return tuple(sorted(minutes, reverse=True))
+
+
+def set_limit(args):
+    if len(args) < 2:
+        sys.exit("Usage: waytime limit set APP MINUTES [--warn 15,5,1] [--action close|kill]")
+    app = args[0].strip()
+    try:
+        minutes = int(args[1])
+    except ValueError:
+        sys.exit(f"Invalid minutes: {args[1]}")
+    if not app or minutes <= 0:
+        sys.exit("APP must be non-empty and MINUTES must be positive")
+
+    warn = core.DEFAULT_WARN_MINUTES
+    action = "close"
+    rest = args[2:]
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--warn" and i + 1 < len(rest):
+            warn = parse_warn(rest[i + 1])
+            i += 2
+        elif rest[i] == "--action" and i + 1 < len(rest):
+            action = rest[i + 1].strip().lower()
+            i += 2
+        else:
+            sys.exit(f"Unknown option: {rest[i]}")
+    if action not in core.VALID_ACTIONS:
+        sys.exit(f"Invalid action: {action} (use close or kill)")
+
+    limits = [
+        limit
+        for limit in core.load_limits(CONFIG_PATH)
+        if core.normalize_app(limit.app) != core.normalize_app(app)
+    ]
+    limits.append(core.Limit(app=app, minutes=minutes, warn_minutes=warn, action=action))
+    limits.sort(key=lambda limit: limit.app.casefold())
+    core.save_limits(limits, CONFIG_PATH)
+    print(f"Limit set: {app} — {minutes} min/day, warnings {list(warn)}, action {action}")
+
+
+def clear_limit(app):
+    limits = core.load_limits(CONFIG_PATH)
+    kept = [
+        limit
+        for limit in limits
+        if core.normalize_app(limit.app) != core.normalize_app(app)
+    ]
+    if len(kept) == len(limits):
+        sys.exit(f"No limit configured for {app}")
+    core.save_limits(kept, CONFIG_PATH)
+    print(f"Limit cleared: {app}")
+
+
 def main():
     args = sys.argv[1:]
     cmd = args[0] if args else "today"
@@ -186,8 +329,24 @@ def main():
         show_days(int(args[1]) if len(args) > 1 else 14)
     elif cmd == "apps":
         show_apps(int(args[1]) if len(args) > 1 else 7)
+    elif cmd == "classes":
+        show_classes(int(args[1]) if len(args) > 1 else 7)
     elif cmd == "sites":
         show_sites(int(args[1]) if len(args) > 1 else 1)
+    elif cmd == "limits":
+        show_limits()
+    elif cmd == "limit":
+        sub = args[1] if len(args) > 1 else "list"
+        if sub == "set":
+            set_limit(args[2:])
+        elif sub == "clear":
+            if len(args) < 3:
+                sys.exit("Usage: waytime limit clear APP")
+            clear_limit(args[2])
+        else:
+            show_limits()
+    elif cmd == "events":
+        show_events()
     else:
         # allow `waytime 2026-07-01`
         try:

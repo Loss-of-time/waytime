@@ -4,28 +4,64 @@
 Injects a KWin script that reports window activations over D-Bus,
 then credits time to the focused app every tick. Pauses while the
 screen is locked. Data lands in a SQLite DB keyed by (date, app).
+
+Per-app daily limits live in ~/.config/waytime/config.toml. When an app runs
+out of time the daemon notifies the user and closes its windows (or kills the
+processes, depending on the limit's action). The app stays blocked for the
+rest of the day: reactivating it closes it again.
+
+This fork talks to D-Bus through Gio (python-gobject) instead of
+python-dbus, so python-gobject is the only Python binding dependency.
 """
 
+import json
 import os
+import shutil
 import signal
-import sqlite3
+import subprocess
 import sys
 import time
 
-import dbus
-import dbus.mainloop.glib
-import dbus.service
-from gi.repository import GLib
+from gi.repository import Gio, GLib
+
+try:
+    from gi.repository import GLibUnix
+except ImportError:  # GLib < 2.80
+    GLibUnix = None
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import waytime_core as core  # noqa: E402
 
 BUS_NAME = "org.waytime.Tracker"
 OBJECT_PATH = "/org/waytime/Tracker"
 DATA_DIR = os.path.expanduser("~/.local/share/waytime")
-DB_PATH = os.path.join(DATA_DIR, "waytime.db")
+DB_PATH = core.DB_PATH
+CONFIG_PATH = core.CONFIG_PATH
 KWIN_SCRIPT_PATH = os.path.join(DATA_DIR, "tracker.js")
 KWIN_SCRIPT_NAME = "waytime-tracker"
 TICK_SECONDS = 5
 # Ignore gaps longer than this (suspend, daemon stall) instead of crediting them.
 MAX_DELTA = TICK_SECONDS * 3
+# Do not try to close the same app more often than this.
+ENFORCE_COOLDOWN = 10
+# How long to wait before force-killing a process after SIGTERM.
+KILL_GRACE_SECONDS = 3
+
+INTROSPECTION_XML = """\
+<node>
+  <interface name="org.waytime.Tracker">
+    <method name="ReportActive">
+      <arg type="s" direction="in"/>
+      <arg type="s" direction="in"/>
+    </method>
+    <method name="ReportEnforced">
+      <arg type="s" direction="in"/>
+      <arg type="s" direction="in"/>
+      <arg type="s" direction="in"/>
+    </method>
+  </interface>
+</node>
+"""
 
 KWIN_SCRIPT = """\
 var waytimeCurrent = null;
@@ -54,6 +90,27 @@ function waytimeActivated(win) {
 workspace.windowActivated.connect(waytimeActivated);
 waytimeActivated(workspace.activeWindow);
 """ % {"bus": BUS_NAME, "path": OBJECT_PATH}
+
+# Loaded on demand by the daemon: close (or collect the PIDs of) every window
+# whose resourceClass matches `target`. The result is reported back over D-Bus
+# so the daemon can kill processes for action="kill" and log the enforcement.
+ENFORCE_SCRIPT = """\
+var target = %(target)s;
+var mode = %(mode)s;
+var pids = [];
+var wins = workspace.stackingOrder;
+for (var i = 0; i < wins.length; i++) {
+    var w = wins[i];
+    if (String(w.resourceClass).toLowerCase() === target) {
+        pids.push(w.pid);
+        if (mode === "close") {
+            w.closeWindow();
+        }
+    }
+}
+callDBus("%(bus)s", "%(path)s", "%(bus)s", "ReportEnforced",
+         target, mode, JSON.stringify(pids));
+"""
 
 # Apps whose window titles get site-level tracking. Keyed by resourceClass.
 BROWSERS = {
@@ -92,111 +149,296 @@ def log(msg):
     print(msg, flush=True)
 
 
-class Store:
-    def __init__(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.execute(
-            """CREATE TABLE IF NOT EXISTS usage (
-                   date TEXT NOT NULL,
-                   app TEXT NOT NULL,
-                   seconds REAL NOT NULL DEFAULT 0,
-                   PRIMARY KEY (date, app)
-               )"""
-        )
-        self.db.execute(
-            """CREATE TABLE IF NOT EXISTS sites (
-                   date TEXT NOT NULL,
-                   site TEXT NOT NULL,
-                   seconds REAL NOT NULL DEFAULT 0,
-                   PRIMARY KEY (date, site)
-               )"""
-        )
-        self.db.commit()
+class Notifier:
+    """Desktop notifications that also survive fullscreen games.
 
-    def add(self, app, site, seconds):
-        today = time.strftime("%Y-%m-%d")
-        self.db.execute(
-            """INSERT INTO usage (date, app, seconds) VALUES (?, ?, ?)
-               ON CONFLICT(date, app) DO UPDATE SET seconds = seconds + excluded.seconds""",
-            (today, app, seconds),
+    Plasma suppresses normal notifications while a fullscreen window is
+    focused, so limit warnings use critical urgency (which is also exempt from
+    Do Not Disturb). Plasma does not auto-expire critical notifications, so we
+    close them ourselves after the timeout.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def send(self, summary, body, urgency=2, timeout_ms=10000):
+        try:
+            self._send_dbus(summary, body, urgency, timeout_ms)
+        except Exception as exc:
+            log(f"notification via D-Bus failed ({exc}); trying notify-send")
+            self._send_fallback(summary, body, urgency)
+
+    def _send_dbus(self, summary, body, urgency, timeout_ms):
+        hints = {
+            "desktop-entry": GLib.Variant("s", "waytime"),
+            "urgency": GLib.Variant("y", urgency),
+        }
+        reply = self.conn.call_sync(
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "Notify",
+            GLib.Variant(
+                "(susssasa{sv}i)",
+                (
+                    "waytime",
+                    0,
+                    "appointment-soon",
+                    summary,
+                    body,
+                    [],
+                    hints,
+                    timeout_ms,
+                ),
+            ),
+            GLib.VariantType.new("(u)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
         )
-        if site:
-            self.db.execute(
-                """INSERT INTO sites (date, site, seconds) VALUES (?, ?, ?)
-                   ON CONFLICT(date, site) DO UPDATE SET seconds = seconds + excluded.seconds""",
-                (today, site, seconds),
+        nid = reply.unpack()[0]
+        GLib.timeout_add(timeout_ms + 1000, self._close, nid)
+
+    def _close(self, nid):
+        try:
+            self.conn.call_sync(
+                "org.freedesktop.Notifications",
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "CloseNotification",
+                GLib.Variant("(u)", (nid,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
             )
-        self.db.commit()
+        except Exception:
+            pass
+        return False  # one-shot timeout
+
+    def _send_fallback(self, summary, body, urgency):
+        if not shutil.which("notify-send"):
+            return
+        try:
+            subprocess.run(
+                [
+                    "notify-send",
+                    "--app-name=waytime",
+                    "--icon=appointment-soon",
+                    f"--urgency={'critical' if urgency >= 2 else 'normal'}",
+                    "--hint=string:desktop-entry:waytime",
+                    summary,
+                    body,
+                ],
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            log(f"notify-send failed: {exc}")
 
 
-class Tracker(dbus.service.Object):
-    def __init__(self, bus):
-        self.bus = bus
-        bus_name = dbus.service.BusName(BUS_NAME, bus=bus)
-        super().__init__(bus_name, OBJECT_PATH)
-
-        self.store = Store(DB_PATH)
+class Tracker:
+    def __init__(self, conn):
+        self.conn = conn
+        self.store = core.Store(DB_PATH)
         self.current_app = ""
         self.current_site = ""
         self.locked = self._query_locked()
         self.last_tick = time.monotonic()
 
-        self._setup_lock_watch()
-        # (Re)inject the KWin script whenever KWin (re)appears on the bus.
-        self.bus.watch_name_owner("org.kde.KWin", self._on_kwin_owner_changed)
-        GLib.timeout_add_seconds(TICK_SECONDS, self._tick)
+        self.limits = core.load_limits(CONFIG_PATH)
+        self.config_mtime = self._config_mtime()
+        self.warned = {}  # (date, app) -> set of already announced minutes
+        self.blocked_notified = set()  # (date, app)
+        self.last_enforce = {}  # app -> monotonic timestamp
+        self.enforce_seq = 0
+        self.notifier = Notifier(conn)
 
-    @dbus.service.method(BUS_NAME, in_signature="ss")
-    def ReportActive(self, app, caption):
+        self._register_service()
+        self._setup_lock_watch()
+        Gio.bus_watch_name_on_connection(
+            conn,
+            "org.kde.KWin",
+            Gio.BusNameWatcherFlags.NONE,
+            self._on_kwin_appeared,
+            self._on_kwin_vanished,
+        )
+        GLib.timeout_add_seconds(TICK_SECONDS, self._tick)
+        if self.limits:
+            log(f"loaded {len(self.limits)} per-app limit(s)")
+
+    # -- D-Bus service -----------------------------------------------------
+
+    def _register_service(self):
+        node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML)
+        self._iface_info = node.interfaces[0]
+        self.conn.register_object(
+            OBJECT_PATH, self._iface_info, self._on_method_call, None, None
+        )
+        Gio.bus_own_name_on_connection(
+            self.conn,
+            BUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            self._on_name_acquired,
+            self._on_name_lost,
+        )
+
+    def _on_name_acquired(self, conn, name):
+        log(f"D-Bus name acquired: {name}")
+
+    def _on_name_lost(self, conn, name):
+        log(f"D-Bus name lost: {name} (another instance running?)")
+
+    def _on_method_call(
+        self, conn, sender, object_path, interface_name, method_name, parameters, invocation
+    ):
+        try:
+            args = parameters.unpack() if parameters is not None else ()
+            if method_name == "ReportActive":
+                self._report_active(args[0], args[1])
+            elif method_name == "ReportEnforced":
+                self._report_enforced(args[0], args[1], args[2])
+            else:
+                invocation.return_dbus_error(
+                    "org.waytime.Error", f"unknown method {method_name}"
+                )
+                return
+            invocation.return_value(None)
+        except Exception as exc:
+            log(f"D-Bus method {method_name} failed: {exc}")
+            try:
+                invocation.return_dbus_error("org.waytime.Error", str(exc))
+            except Exception:
+                pass
+
+    def _report_active(self, app, caption):
         app = str(app).strip()
         site = site_from_caption(str(caption)) if app in BROWSERS else ""
         if app != self.current_app or site != self.current_site:
             self._credit()
             self.current_app = app
             self.current_site = site
+            self._check_limits(app)
+
+    def _report_enforced(self, app, mode, pids_json):
+        """Called by the one-shot enforcement script after it ran."""
+        try:
+            pids = [int(p) for p in json.loads(str(pids_json))]
+        except (ValueError, TypeError):
+            pids = []
+        pids = [p for p in pids if p > 1]
+        if pids:
+            self.store.log_event(str(app), "enforce", f"{mode} pids={pids}")
+        if str(mode) == "kill":
+            for pid in pids:
+                self._terminate(pid)
+
+    # -- KWin / lock state -------------------------------------------------
 
     def _query_locked(self):
         try:
-            ss = self.bus.get_object("org.freedesktop.ScreenSaver", "/ScreenSaver")
-            return bool(ss.GetActive(dbus_interface="org.freedesktop.ScreenSaver"))
-        except dbus.DBusException:
+            reply = self.conn.call_sync(
+                "org.freedesktop.ScreenSaver",
+                "/ScreenSaver",
+                "org.freedesktop.ScreenSaver",
+                "GetActive",
+                None,
+                GLib.VariantType.new("(b)"),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
+            )
+            return bool(reply.unpack()[0])
+        except Exception:
             return False
 
     def _setup_lock_watch(self):
-        self.bus.add_signal_receiver(
-            self._on_lock_changed,
-            signal_name="ActiveChanged",
-            dbus_interface="org.freedesktop.ScreenSaver",
-            path="/ScreenSaver",
+        self.conn.signal_subscribe(
+            "org.freedesktop.ScreenSaver",
+            "org.freedesktop.ScreenSaver",
+            "ActiveChanged",
+            "/ScreenSaver",
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_lock_signal,
         )
+
+    def _on_lock_signal(self, conn, sender, path, iface, signal_name, params):
+        try:
+            active = params.unpack()[0]
+        except Exception:
+            return
+        self._on_lock_changed(active)
 
     def _on_lock_changed(self, active):
         self._credit()
         self.locked = bool(active)
         log(f"screen {'locked' if self.locked else 'unlocked'}")
 
-    def _on_kwin_owner_changed(self, owner):
-        if owner:
-            # Give KWin's scripting engine a moment to come up after restart.
-            GLib.timeout_add_seconds(2, self._load_kwin_script)
+    def _on_kwin_appeared(self, conn, name, owner):
+        # Give KWin's scripting engine a moment to come up after restart.
+        GLib.timeout_add_seconds(2, self._load_kwin_script)
+
+    def _on_kwin_vanished(self, conn, name):
+        log("KWin left the bus; waiting for it to come back")
+
+    def _kwin_call(self, method, params, reply_type=None):
+        return self.conn.call_sync(
+            "org.kde.KWin",
+            "/Scripting",
+            "org.kde.kwin.Scripting",
+            method,
+            params,
+            reply_type,
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        )
 
     def _load_kwin_script(self):
         try:
             with open(KWIN_SCRIPT_PATH, "w") as f:
                 f.write(KWIN_SCRIPT)
-            kwin = self.bus.get_object("org.kde.KWin", "/Scripting")
-            iface = dbus.Interface(kwin, "org.kde.kwin.Scripting")
-            if iface.isScriptLoaded(KWIN_SCRIPT_NAME):
-                iface.unloadScript(KWIN_SCRIPT_NAME)
-            # loadScript is overloaded; force the (path, pluginName) variant.
-            iface.loadScript(KWIN_SCRIPT_PATH, KWIN_SCRIPT_NAME, signature="ss")
-            iface.start()
+            loaded = self._kwin_call(
+                "isScriptLoaded",
+                GLib.Variant("(s)", (KWIN_SCRIPT_NAME,)),
+                GLib.VariantType.new("(b)"),
+            ).unpack()[0]
+            if loaded:
+                self._kwin_call("unloadScript", GLib.Variant("(s)", (KWIN_SCRIPT_NAME,)))
+            self._kwin_call(
+                "loadScript",
+                GLib.Variant("(ss)", (KWIN_SCRIPT_PATH, KWIN_SCRIPT_NAME)),
+                GLib.VariantType.new("(i)"),
+            )
+            self._kwin_call("start", None)
             log("KWin tracker script loaded")
-        except dbus.DBusException as e:
+        except Exception as e:
             log(f"failed to load KWin script, retrying in 10s: {e}")
             GLib.timeout_add_seconds(10, self._load_kwin_script)
         return False  # one-shot timeout
+
+    def _unload_kwin_script(self):
+        try:
+            self._kwin_call("unloadScript", GLib.Variant("(s)", (KWIN_SCRIPT_NAME,)))
+        except Exception:
+            pass
+
+    # -- tracking / limits -------------------------------------------------
+
+    def _config_mtime(self):
+        try:
+            return os.stat(CONFIG_PATH).st_mtime_ns
+        except OSError:
+            return None
+
+    def _reload_limits(self):
+        mtime = self._config_mtime()
+        if mtime == self.config_mtime:
+            return
+        self.config_mtime = mtime
+        self.limits = core.load_limits(CONFIG_PATH)
+        log(f"limits reloaded: {len(self.limits)} configured")
 
     def _credit(self):
         """Credit elapsed time since last tick to the current app."""
@@ -210,24 +452,129 @@ class Tracker(dbus.service.Object):
         if self.current_app in IGNORED_APPS:
             return
         self.store.add(self.current_app, self.current_site, delta)
+        self._check_limits(self.current_app)
 
     def _tick(self):
-        self._credit()
+        try:
+            self._reload_limits()
+            self._prune_state()
+            self._credit()
+        except Exception as exc:  # keep the daemon alive on transient errors
+            log(f"tick error: {exc}")
         return True
+
+    def _prune_state(self):
+        day = core.today()
+        for key in list(self.warned):
+            if key[0] != day:
+                del self.warned[key]
+        self.blocked_notified = {k for k in self.blocked_notified if k[0] == day}
+
+    def _check_limits(self, app):
+        limit = core.find_limit(self.limits, app)
+        if limit is None:
+            return
+        used = self.store.usage(app)
+        remaining = core.remaining_seconds(limit, used)
+        key = (core.today(), core.normalize_app(app))
+        name = core.pretty_app(app)
+
+        if remaining <= 0:
+            if key not in self.blocked_notified:
+                self.blocked_notified.add(key)
+                verb = (
+                    "Windows will be closed"
+                    if limit.action == "close"
+                    else "Processes will be terminated"
+                )
+                self.notifier.send(
+                    f"waytime — {name}: daily limit reached",
+                    f"{limit.minutes} min used today. {verb}; "
+                    "the limit resets at midnight.",
+                )
+                self.store.log_event(app, "blocked", f"limit={limit.minutes}m")
+            self._enforce(app, limit)
+            return
+
+        fired = self.warned.setdefault(key, set())
+        minutes = core.due_warning(limit, remaining, fired)
+        if minutes is not None:
+            self.notifier.send(
+                f"waytime — {name}: {minutes} min left",
+                f"Daily limit {limit.minutes} min. "
+                "The app will be closed when it runs out.",
+            )
+            self.store.log_event(app, "warn", f"{minutes}m remaining")
+
+    def _enforce(self, app, limit):
+        now = time.monotonic()
+        if now - self.last_enforce.get(app, 0.0) < ENFORCE_COOLDOWN:
+            return
+        self.last_enforce[app] = now
+        self.enforce_seq += 1
+        name = f"waytime-enforce-{self.enforce_seq}"
+        path = os.path.join(DATA_DIR, f"enforce-{self.enforce_seq}.js")
+        body = ENFORCE_SCRIPT % {
+            "target": json.dumps(core.normalize_app(app)),
+            "mode": json.dumps(limit.action),
+            "bus": BUS_NAME,
+            "path": OBJECT_PATH,
+        }
+        try:
+            with open(path, "w") as fh:
+                fh.write(body)
+        except OSError as exc:
+            log(f"cannot write enforcement script: {exc}")
+            return
+        try:
+            self._kwin_call(
+                "loadScript",
+                GLib.Variant("(ss)", (path, name)),
+                GLib.VariantType.new("(i)"),
+            )
+            self._kwin_call("start", None)
+            log(f"enforced {app}: {limit.action}")
+        except Exception as exc:
+            log(f"enforcement failed for {app}: {exc}")
+        GLib.timeout_add_seconds(3, self._cleanup_enforce, path, name)
+
+    def _cleanup_enforce(self, path, name):
+        try:
+            self._kwin_call("unloadScript", GLib.Variant("(s)", (name,)))
+        except Exception:
+            pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False  # one-shot timeout
+
+    def _terminate(self, pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+        GLib.timeout_add_seconds(KILL_GRACE_SECONDS, self._kill_hard, pid)
+
+    def _kill_hard(self, pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        return False  # one-shot timeout
 
     def shutdown(self):
         self._credit()
-        try:
-            kwin = self.bus.get_object("org.kde.KWin", "/Scripting")
-            dbus.Interface(kwin, "org.kde.kwin.Scripting").unloadScript(KWIN_SCRIPT_NAME)
-        except dbus.DBusException:
-            pass
+        self._unload_kwin_script()
 
 
 def main():
-    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-    bus = dbus.SessionBus()
-    tracker = Tracker(bus)
+    try:
+        conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception as exc:
+        sys.exit(f"cannot connect to the session bus: {exc}")
+
+    tracker = Tracker(conn)
     loop = GLib.MainLoop()
 
     def stop(*_):
@@ -235,7 +582,10 @@ def main():
         loop.quit()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, stop)
+        if GLibUnix is not None:
+            GLibUnix.signal_add(GLib.PRIORITY_HIGH, sig, stop)
+        else:
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, stop)
 
     log("waytime daemon started")
     loop.run()
