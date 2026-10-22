@@ -30,15 +30,19 @@ unchanged (same KWin D-Bus API), though that's untested.
 
 ## Install
 
-From the AUR:
+This fork is not packaged on the AUR yet — the AUR `waytime` package is
+upstream and has no limits. Install this clone per user (no root needed):
 
 ```
-yay -S waytime        # or paru, or makepkg -si from a clone
+git clone https://github.com/Loss-of-time/waytime.git
+cd waytime
+mkdir -p ~/.local/bin ~/.config/systemd/user
+install -m755 waytime waytime-daemon ~/.local/bin/
+install -m644 waytime_core.py ~/.local/bin/
+sed "s|/usr/bin/waytime-daemon|$HOME/.local/bin/waytime-daemon|" waytime.service > ~/.config/systemd/user/waytime.service
+systemctl --user daemon-reload
 systemctl --user enable --now waytime
 ```
-
-This installs `waytime` (CLI) and `waytime-daemon` to `/usr/bin`, and the
-user service to `/usr/lib/systemd/user/waytime.service`.
 
 ### Other distros (Kubuntu, Fedora KDE, openSUSE, …)
 
@@ -51,18 +55,7 @@ sudo dnf install python3-gobject   # Fedora
 sudo zypper install python3-gobject   # openSUSE
 ```
 
-Then install to your user account (no root needed):
-
-```
-git clone https://github.com/Loss-of-time/waytime.git
-cd waytime
-mkdir -p ~/.local/bin ~/.config/systemd/user
-install -m755 waytime waytime-daemon ~/.local/bin/
-install -m644 waytime_core.py ~/.local/bin/
-sed "s|/usr/bin/waytime-daemon|$HOME/.local/bin/waytime-daemon|" waytime.service > ~/.config/systemd/user/waytime.service
-systemctl --user daemon-reload
-systemctl --user enable --now waytime
-```
+Then run the same install commands as above.
 
 Make sure `~/.local/bin` is on your `PATH`. To uninstall:
 `systemctl --user disable --now waytime`, then delete the installed files
